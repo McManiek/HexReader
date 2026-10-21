@@ -4,8 +4,7 @@ interface
 
 uses
   System.SysUtils,
-  Winapi.Windows,
-  System.Math;
+  Winapi.Windows;
 
 const
   HEX_RECORD_MARK = ':';
@@ -17,7 +16,7 @@ type
       rtUnknown = -1,
       rtData = 0,
       rtEndOfFile = 1,
-      rtExtSegmentAddres = 2,
+      rtExtSegmentAddress = 2,
       rtStartSegmentAddress = 3,
       rtExtLinearAddress = 4,
       rtStartLinearAddress = 5
@@ -35,14 +34,20 @@ type
   function NewHexRec: PHexRec;
   procedure DisposeHexRec(AHexRec: PHexRec);
 
-  function ParseHex(AString: String; out APtrHexRec: PHexRec): Boolean;
+  function ParseHex(const AString: String; var APtrHexRec: PHexRec): Boolean;
 
 implementation
+
+procedure InitHexRec(AHexRec: PHexRec);
+begin
+  ZeroMemory(AHexRec, SizeOf(THexRec));
+  AHexRec^.RecType := THexRecType.rtUnknown;
+end;
 
 function NewHexRec: PHexRec;
 begin
   New(Result);
-  ZeroMemory(Result, SizeOf(THexRec));
+  InitHexRec(Result);
 end;
 
 procedure DisposeHexRec(AHexRec: PHexRec);
@@ -51,7 +56,7 @@ begin
     Exit;
 
   try
-    if (AHexRec^.RecLen > 0) and (Assigned(AHexRec^.Data)) then
+    if Assigned(AHexRec^.Data) then
       FreeMem(AHexRec^.Data);
 
     ZeroMemory(AHexRec, SizeOf(THexRec));
@@ -60,30 +65,40 @@ begin
   end;
 end;
 
+function IsHexString(const AStr: String): Boolean;
+var
+  C: Char;
+begin
+  Result := Length(AStr) > 0;
+  for C in AStr do
+    if not CharInSet(C, ['0'..'9', 'A'..'F', 'a'..'f']) then
+      Exit(False);
+end;
+
 function ReadHexBytes(const AInString: String; var AStartPos: Integer; ABytesToRead: Integer; out AOutInt: LongWord): Boolean;
 var
   tmpStr: String;
   tmpErrCode: Integer;
 begin
   Result := False;
-  if AStartPos > Length(AInString) then
+  AOutInt := 0;
+  if (AStartPos < 1) or (AStartPos > Length(AInString)) then
     Exit;
 
-  if ABytesToRead <= 0 then
+  if (ABytesToRead <= 0) or (ABytesToRead > SizeOf(LongWord)) then
     Exit;
 
-  if ABytesToRead > SizeOf(Integer) then
+  ABytesToRead := ABytesToRead * 2;
+  tmpStr := Copy(AInString, AStartPos, ABytesToRead);
+
+  //reject truncated lines and characters Val would tolerate (spaces, signs)
+  if (Length(tmpStr) <> ABytesToRead) or (not IsHexString(tmpStr)) then
     Exit;
 
-  try
-    ABytesToRead := ABytesToRead * 2;
-    tmpStr := Copy(AInString, AStartPos, ABytesToRead);
-    Val('$' + tmpStr, AOutInt, tmpErrCode);
-    Result := (tmpErrCode = 0);
-  finally
-    if Result then
-      Inc(AStartPos, ABytesToRead);
-  end;
+  Val('$' + tmpStr, AOutInt, tmpErrCode);
+  Result := (tmpErrCode = 0);
+  if Result then
+    Inc(AStartPos, ABytesToRead);
 end;
 
 procedure CalcHexChecksum(var AChecksum: LongWord; AInputInt: LongWord; ABytes: Byte);
@@ -98,12 +113,14 @@ begin
   end;
 end;
 
-function ParseHex(AString: String; out APtrHexRec: PHexRec): Boolean;
+function ParseHex(const AString: String; var APtrHexRec: PHexRec): Boolean;
 var
   HexMarkPos: Integer;
+  RecString: String;
   StrPosition: Integer;
   IntVal: LongWord;
-  BytesLeft, BytesToRead: Integer;
+  I: Integer;
+  ExpectedLen: Integer;
   tmpDataPtr: PByte;
   tmpChksum: LongWord;
 begin
@@ -112,69 +129,84 @@ begin
   if HexMarkPos = 0 then
     Exit;
 
-  Delete(AString, 1, HexMarkPos);
+  RecString := Copy(AString, HexMarkPos + 1, MaxInt);
+
   if not Assigned(APtrHexRec) then
-    New(APtrHexRec);
+    APtrHexRec := NewHexRec
+  else
+  begin
+    //record is reused, release data left from a previous parse
+    if Assigned(APtrHexRec^.Data) then
+      FreeMem(APtrHexRec^.Data);
+    InitHexRec(APtrHexRec);
+  end;
 
   StrPosition := 1;
   tmpChksum := 0;
 
   //read record length
-  if not ReadHexBytes(AString, StrPosition, 1, IntVal) then
-    raise EHexParserException.Create(Format('Failed to read Record length (pos: %d)', [StrPosition]));
+  if not ReadHexBytes(RecString, StrPosition, 1, IntVal) then
+    raise EHexParserException.Create(Format('Failed to read Record length (pos: %d)', [StrPosition + HexMarkPos]));
 
   APtrHexRec^.RecLen := Byte(IntVal and $FF);
   CalcHexChecksum(tmpChksum, IntVal, 1);
 
   //read offset
-  if not ReadHexBytes(AString, StrPosition, 2, IntVal) then
-    raise EHexParserException.Create(Format('Failed to read offset (pos: %d)', [StrPosition]));
+  if not ReadHexBytes(RecString, StrPosition, 2, IntVal) then
+    raise EHexParserException.Create(Format('Failed to read offset (pos: %d)', [StrPosition + HexMarkPos]));
 
-  APtrHexRec^.Offset := Byte(IntVal and $FFFF);
+  APtrHexRec^.Offset := Word(IntVal and $FFFF);
   CalcHexChecksum(tmpChksum, IntVal, 2);
 
   //read record type
-  if not ReadHexBytes(AString, StrPosition, 1, IntVal) then
-    raise EHexParserException.Create(Format('Failed to read record type (pos: %d)', [StrPosition]));
+  if not ReadHexBytes(RecString, StrPosition, 1, IntVal) then
+    raise EHexParserException.Create(Format('Failed to read record type (pos: %d)', [StrPosition + HexMarkPos]));
 
-  if ((IntVal and $FF) >= Ord(THexRecType.rtData)) and ((IntVal and $FF) <= Ord(THexRecType.rtStartLinearAddress)) then
-    APtrHexRec^.RecType := THexRecType( IntVal and $FF );
+  if IntVal > LongWord(Ord(THexRecType.rtStartLinearAddress)) then
+    raise EHexParserException.Create(Format('Invalid or unsupported record type (%.2x)', [IntVal]));
 
-  if APtrHexRec^.RecType = THexRecType.rtUnknown then
-    raise EHexParserException.Create('Invalid or unsupported record type');
-
+  APtrHexRec^.RecType := THexRecType(IntVal);
   CalcHexChecksum(tmpChksum, IntVal, 1);
+
+  //validate record length against record type
+  case APtrHexRec^.RecType of
+    THexRecType.rtEndOfFile:
+      ExpectedLen := 0;
+    THexRecType.rtExtSegmentAddress, THexRecType.rtExtLinearAddress:
+      ExpectedLen := 2;
+    THexRecType.rtStartSegmentAddress, THexRecType.rtStartLinearAddress:
+      ExpectedLen := 4;
+  else
+    ExpectedLen := -1;
+  end;
+
+  if (ExpectedLen >= 0) and (APtrHexRec^.RecLen <> ExpectedLen) then
+    raise EHexParserException.Create(Format('Invalid record length (%d) for record type %.2x', [APtrHexRec^.RecLen, Ord(APtrHexRec^.RecType)]));
 
   //read data
   if APtrHexRec^.RecLen > 0 then
   begin
     GetMem(APtrHexRec^.Data, APtrHexRec^.RecLen);
     tmpDataPtr := APtrHexRec^.Data;
-    BytesLeft := APtrHexRec^.RecLen;
 
-    while BytesLeft > 0 do
+    for I := 0 to APtrHexRec^.RecLen-1 do
     begin
-      BytesToRead := Min(1, BytesLeft);
-      if BytesToRead = 0 then
-        Break;
+      if not ReadHexBytes(RecString, StrPosition, 1, IntVal) then
+        raise EHexParserException.Create(Format('Failed to read record data (pos: %d)', [StrPosition + HexMarkPos]));
 
-      if not ReadHexBytes(AString, StrPosition, BytesToRead, IntVal) then
-        raise EHexParserException.Create(Format('Failed to read record data (pos: %d)', [StrPosition]));
-
-      CalcHexChecksum(tmpChksum, IntVal, BytesToRead);
-      CopyMemory(tmpDataPtr, @IntVal, BytesToRead);
-      Inc(tmpDataPtr, BytesToRead);
-      Dec(BytesLeft, BytesToRead);
+      CalcHexChecksum(tmpChksum, IntVal, 1);
+      tmpDataPtr^ := Byte(IntVal and $FF);
+      Inc(tmpDataPtr);
     end;
   end;
 
   //read checksum
-  if not ReadHexBytes(AString, StrPosition, 1, IntVal) then
-    raise EHexParserException.Create(Format('Failed to read record checksum (pos: %d)', [StrPosition]));
+  if not ReadHexBytes(RecString, StrPosition, 1, IntVal) then
+    raise EHexParserException.Create(Format('Failed to read record checksum (pos: %d)', [StrPosition + HexMarkPos]));
 
   APtrHexRec^.Checksum := Byte(IntVal and $FF);
 
-  tmpChksum := $100 - (tmpChksum and $FF);
+  tmpChksum := ($100 - (tmpChksum and $FF)) and $FF;
   if tmpChksum <> APtrHexRec^.Checksum then
     raise EHexParserException.Create('Data integrity test failed (invalid checksum)');
 
